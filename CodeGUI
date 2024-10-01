@@ -1,0 +1,373 @@
+#Detective by Viaja Tech es una aplicación escrita en Python que permite a los usuarios recopilar y visualizar información relacionada con dominios y direcciones IP. La herramienta realiza diversas transformaciones sobre la entidad ingresada y muestra los resultados en un grafo interactivo. Los usuarios pueden explorar el grafo, obtener información detallada de cada nodo y generar informes en PDF con los resultados del análisis.
+#by David Ruiz (@viajatech)
+#Recuerda darme créditos en mis redes sociales y darle estrella este repo,gracias! 
+
+
+#pip install PyQt5 networkx matplotlib pandas python-whois reportlab asyncio aiohttp nest_asyncio
+
+# detective_viaja_tech.py
+
+import sys
+import traceback
+import asyncio
+import nest_asyncio
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QPushButton, QLineEdit,
+    QLabel, QMessageBox, QTextEdit, QHBoxLayout, QFileDialog
+)
+from PyQt5.QtGui import QIcon, QPixmap, QCursor
+from PyQt5.QtCore import Qt, QObject
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import networkx as nx
+import matplotlib.pyplot as plt
+import aiohttp
+import whois  # Asegúrate de que este es el paquete 'python-whois'
+import socket
+from reportlab.pdfgen import canvas as pdf_canvas
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.units import inch
+import io
+
+# Permitir anidar loops de asyncio
+nest_asyncio.apply()
+
+class MplCanvas(FigureCanvas):
+
+    def __init__(self, parent=None, width=8, height=6, dpi=100):
+        self.parent_window = parent  # Referencia al objeto MainWindow
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = self.fig.add_subplot(111)
+        super(MplCanvas, self).__init__(self.fig)
+        self.setParent(parent)
+        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+
+    def on_click(self, event):
+        # Detectar doble clic
+        if event.dblclick:
+            # Obtener el nodo más cercano al punto clicado
+            x_click = event.xdata
+            y_click = event.ydata
+            if x_click is not None and y_click is not None:
+                closest_node = None
+                min_dist = float('inf')
+                for node, (x_node, y_node) in self.pos.items():
+                    dist = (x_click - x_node) ** 2 + (y_click - y_node) ** 2
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_node = node
+                if closest_node is not None:
+                    self.parent_window.show_node_info(closest_node)
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Detective by Viaja Tech')
+        self.setGeometry(100, 100, 1000, 800)
+
+        # Crear el canvas para dibujar el grafo
+        self.canvas = MplCanvas(self, width=8, height=6, dpi=100)
+
+        # Crear el grafo
+        self.G = nx.Graph()
+
+        # Widgets de la interfaz
+        self.input_label = QLabel('Ingrese una entidad (por ejemplo, un dominio o IP):')
+        self.entity_input = QLineEdit()
+        self.transform_button = QPushButton('Transformar')
+        self.transform_button.clicked.connect(self.perform_transform)
+
+        # Botón para guardar en PDF
+        self.save_pdf_button = QPushButton('Guardar en PDF')
+        self.save_pdf_button.clicked.connect(self.save_to_pdf)
+
+        # Área de texto para mensajes de registro
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+
+        # Layout de botones
+        self.button_layout = QHBoxLayout()
+        self.button_layout.addWidget(self.transform_button)
+        self.button_layout.addWidget(self.save_pdf_button)
+
+        # Layout de la interfaz
+        self.widget = QWidget()
+        self.layout = QVBoxLayout()
+        self.layout.addWidget(self.input_label)
+        self.layout.addWidget(self.entity_input)
+        self.layout.addLayout(self.button_layout)
+        self.layout.addWidget(self.canvas)
+        self.layout.addWidget(QLabel('Log de errores y mensajes:'))
+        self.layout.addWidget(self.log_text)
+        self.widget.setLayout(self.layout)
+        self.setCentralWidget(self.widget)
+
+        # Diccionario para almacenar información de nodos
+        self.node_info = {}
+
+    def log(self, message):
+        self.log_text.append(message)
+
+    def perform_transform(self):
+        entity = self.entity_input.text().strip()
+        if not entity:
+            QMessageBox.warning(self, 'Advertencia', 'Por favor, ingrese una entidad válida.')
+            return
+
+        # Limpiar el grafo anterior y el área de log
+        self.G.clear()
+        self.canvas.axes.clear()
+        self.log_text.clear()
+        self.node_info.clear()
+
+        # Agregar la entidad inicial al grafo
+        self.G.add_node(entity, type='entity')
+        self.node_info[entity] = {'Tipo': 'Entidad ingresada', 'Información': entity}
+
+        try:
+            # Iniciar el bucle de eventos de asyncio
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self.transform_entity(entity))
+
+            # Dibujar el grafo actualizado
+            self.draw_graph()
+
+        except Exception as e:
+            error_msg = f"Ocurrió un error: {e}\nTraceback:\n{traceback.format_exc()}"
+            QMessageBox.critical(self, 'Error', error_msg)
+            self.log(error_msg)
+
+    async def transform_entity(self, entity):
+        if self.is_ip(entity):
+            await self.transform_ip(entity)
+        else:
+            await self.transform_domain(entity)
+
+    def is_ip(self, entity):
+        try:
+            socket.inet_aton(entity)
+            return True
+        except socket.error:
+            return False
+
+    async def transform_domain(self, domain):
+        try:
+            # Resolver el dominio a IP
+            ip = socket.gethostbyname(domain)
+            self.G.add_node(ip, type='ip')
+            self.G.add_edge(domain, ip, relation='resolves_to')
+            self.node_info[ip] = {'Tipo': 'Dirección IP', 'Información': ip}
+            await self.transform_ip(ip)
+        except socket.gaierror as e:
+            error_msg = f"No se pudo resolver el dominio: {e}"
+            QMessageBox.warning(self, 'Error', error_msg)
+            self.log(error_msg)
+            return
+
+        # Obtener registros DNS
+        dns_records = await self.get_dns_records(domain)
+        for record_type, records in dns_records.items():
+            for record in records:
+                self.G.add_node(record, type='dns_record', record_type=record_type)
+                self.G.add_edge(domain, record, relation=record_type)
+                self.node_info[record] = {'Tipo': f'Registro DNS ({record_type})', 'Información': record}
+
+        # Obtener información WHOIS
+        whois_info = self.get_whois(domain)
+        if whois_info:
+            for key, value in whois_info.items():
+                node_label = f"{key}: {value}"
+                self.G.add_node(node_label, type='whois')
+                self.G.add_edge(domain, node_label, relation='whois_info')
+                self.node_info[node_label] = {'Tipo': 'Información WHOIS', 'Información': f"{key}: {value}"}
+
+    async def transform_ip(self, ip):
+        # Obtener información geográfica de la IP
+        geo_info = await self.get_geo_info(ip)
+        if geo_info:
+            location = f"{geo_info.get('city', 'Desconocido')}, {geo_info.get('country', 'Desconocido')}"
+            self.G.add_node(location, type='location')
+            self.G.add_edge(ip, location, relation='located_in')
+            self.node_info[location] = {'Tipo': 'Ubicación', 'Información': geo_info}
+
+        # Nota: Se ha eliminado la funcionalidad de escaneo de puertos por consideraciones éticas y de política.
+
+    async def get_dns_records(self, domain):
+        # Utilizar aiohttp para solicitudes asíncronas
+        dns_records = {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f'https://dns.google/resolve?name={domain}&type=ANY') as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'Answer' in data:
+                            for answer in data['Answer']:
+                                record_type = answer['type']
+                                record_value = answer['data']
+                                record_type_str = self.dns_type_to_string(record_type)
+                                if record_type_str not in dns_records:
+                                    dns_records[record_type_str] = []
+                                dns_records[record_type_str].append(record_value)
+                    else:
+                        error_msg = 'Error al obtener registros DNS.'
+                        QMessageBox.warning(self, 'Error', error_msg)
+                        self.log(error_msg)
+        except Exception as e:
+            error_msg = f"Error al obtener registros DNS: {e}"
+            QMessageBox.warning(self, 'Error', error_msg)
+            self.log(error_msg)
+        return dns_records
+
+    def dns_type_to_string(self, dns_type):
+        dns_types = {
+            1: 'A',
+            2: 'NS',
+            5: 'CNAME',
+            6: 'SOA',
+            15: 'MX',
+            16: 'TXT',
+            28: 'AAAA',
+        }
+        return dns_types.get(dns_type, str(dns_type))
+
+    def get_whois(self, domain):
+        # Obtener información WHOIS del dominio
+        try:
+            w = whois.whois(domain)
+            whois_info = {
+                'Registrador': w.registrar,
+                'Creado en': str(w.creation_date),
+                'Expira en': str(w.expiration_date),
+                'Servidores DNS': ', '.join(w.name_servers) if w.name_servers else 'N/A',
+            }
+            return whois_info
+        except Exception as e:
+            error_msg = f"Error al obtener información WHOIS: {e}"
+            QMessageBox.warning(self, 'Error', error_msg)
+            self.log(error_msg)
+            return None
+
+    async def get_geo_info(self, ip):
+        # Utilizar una API alternativa para obtener información geográfica
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f'http://ip-api.com/json/{ip}') as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data
+                    else:
+                        error_msg = 'Error al obtener información geográfica.'
+                        self.log(error_msg)
+                        return {}
+        except Exception as e:
+            error_msg = f"Error al obtener información geográfica: {e}"
+            self.log(error_msg)
+            return {}
+
+    def draw_graph(self):
+        self.pos = nx.spring_layout(self.G, k=0.5, iterations=20)
+        self.canvas.pos = self.pos  # Pasar la posición al canvas
+        self.canvas.parent_window = self  # Establecer el padre para acceso desde el canvas
+
+        # Dibujar nodos y aristas
+        self.canvas.axes.clear()
+        node_types = {
+            'entity': {'color': 'lightblue', 'shape': 'o', 'size': 800},
+            'ip': {'color': 'lightgreen', 'shape': 's', 'size': 600},
+            'dns_record': {'color': 'orange', 'shape': '^', 'size': 600},
+            'whois': {'color': 'pink', 'shape': 'h', 'size': 500},
+            'location': {'color': 'lightcoral', 'shape': 'D', 'size': 600},
+        }
+
+        for node_type, style in node_types.items():
+            nodelist = [n for n, attr in self.G.nodes(data=True) if attr.get('type') == node_type]
+            nx.draw_networkx_nodes(
+                self.G, self.pos, nodelist=nodelist, node_color=style['color'],
+                node_shape=style['shape'], node_size=style['size'], ax=self.canvas.axes
+            )
+
+        # Dibujar aristas
+        nx.draw_networkx_edges(self.G, self.pos, ax=self.canvas.axes)
+
+        # Dibujar etiquetas de nodos
+        nx.draw_networkx_labels(self.G, self.pos, font_size=8, ax=self.canvas.axes)
+
+        # Dibujar etiquetas de aristas
+        edge_labels = nx.get_edge_attributes(self.G, 'relation')
+        nx.draw_networkx_edge_labels(self.G, self.pos, edge_labels=edge_labels, font_size=6, ax=self.canvas.axes)
+
+        # Actualizar el canvas
+        self.canvas.axes.set_axis_off()
+        self.canvas.draw()
+
+    def show_node_info(self, node):
+        info = self.node_info.get(node, {})
+        info_text = f"Información del nodo '{node}':\n"
+        for key, value in info.items():
+            info_text += f"{key}: {value}\n"
+        QMessageBox.information(self, f"Información de {node}", info_text)
+
+    def save_to_pdf(self):
+        try:
+            # Abrir diálogo para seleccionar ruta y nombre del archivo
+            options = QFileDialog.Options()
+            options |= QFileDialog.DontUseNativeDialog
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Guardar PDF", "", "Archivos PDF (*.pdf)", options=options
+            )
+            if not file_path:
+                return  # El usuario canceló el guardado
+
+            # Asegurarse de que el nombre del archivo termine con '.pdf'
+            if not file_path.lower().endswith('.pdf'):
+                file_path += '.pdf'
+
+            # Generar la imagen del grafo
+            buf = io.BytesIO()
+            self.canvas.fig.savefig(buf, format='png')
+            buf.seek(0)
+            img_reader = ImageReader(buf)
+
+            # Crear el PDF
+            c = pdf_canvas.Canvas(file_path, pagesize=A4)
+            width, height = A4
+
+            # Página 1: Grafo
+            c.drawImage(img_reader, 0.5 * inch, 2 * inch, width=7 * inch, height=7 * inch)
+            c.setFont("Helvetica-Bold", 16)
+            c.drawCentredString(width / 2, height - 1 * inch, "Detective by Viaja Tech")
+            c.showPage()
+
+            # Páginas siguientes: Información detallada
+            c.setFont("Times-Roman", 12)
+            text = c.beginText(0.5 * inch, height - 1 * inch)
+            text.textLine("Información detallada de los nodos:")
+            for node, info in self.node_info.items():
+                text.textLine(f"\nNodo: {node}")
+                for key, value in info.items():
+                    text.textLine(f"  {key}: {value}")
+                # Verificar si el texto excede la página
+                if text.getY() < 1 * inch:
+                    c.drawText(text)
+                    c.showPage()
+                    text = c.beginText(0.5 * inch, height - 1 * inch)
+            c.drawText(text)
+
+            c.save()
+            QMessageBox.information(self, "Éxito", f"El archivo PDF se ha guardado en:\n{file_path}")
+        except Exception as e:
+            error_msg = f"Error al guardar el PDF: {e}"
+            QMessageBox.warning(self, 'Error', error_msg)
+            self.log(error_msg)
+
+if __name__ == '__main__':
+    try:
+        app = QApplication(sys.argv)
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"Error al ejecutar la aplicación: {e}")
+        print(traceback.format_exc())
