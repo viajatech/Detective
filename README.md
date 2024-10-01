@@ -4,6 +4,8 @@ Los usuarios pueden explorar el grafo, obtener información detallada de cada no
 ----------
 ![](https://github.com/viajatech/Detective/blob/main/GUI%20Detective.png)
 ![](https://github.com/viajatech/Detective/blob/main/GUI%20NODOS.png)
+![](https://github.com/viajatech/Detective/blob/main/PDF%20GRAFOS%20GUI%20NODOS.png)
+![](https://github.com/viajatech/Detective/blob/main/PDF%20GUI%20GRAFOS.png)
 ------
 by David Ruiz (@viajatech)
 Dale estrellita al repo si usas mi script gracias! 
